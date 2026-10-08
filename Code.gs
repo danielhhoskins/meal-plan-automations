@@ -4,7 +4,9 @@
  * @see https://developers.google.com/apps-script/guides/triggers#onedite
  */
 
-function onEdit(e) {
+// Runs from an installable trigger (see installEditTrigger) because simple onEdit
+// triggers aren't allowed to call UrlFetchApp, which the LLM food lookup needs.
+function onEditInstalled(e) {
   changeMacrosBasedOnChangeToAmount(e);
   newValueOfIndividualMacro(e);
   addAmountToIndividualMacro(e);
@@ -305,8 +307,18 @@ function searchForFoodAndFillRow(e) {
     return;
   }
   let data = ss.getSheetByName("Foods").getDataRange().getValues();
-  let matchedRowIndex = getBestMatch(enteredStr, e);
-  copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
+  let llmChoice = chooseFoodWithLlm(String(e.range.getValue()), data);
+  if (llmChoice !== null && llmChoice.row === -1) {
+    Logger.log("LLM found no matching food for: " + enteredStr);
+    return;
+  }
+  let matchedRowIndex = llmChoice !== null ? llmChoice.row : getBestMatch(enteredStr, e); // LLM call failed: use the old algorithm
+  let scaledRow = llmChoice !== null && llmChoice.amount !== null ? scaleFoodRow(data[matchedRowIndex], llmChoice.amount) : null;
+  if (scaledRow !== null) { // Write the already-scaled row in one go so the Foods amount never shows
+    ss.getRange(`Meal Plan!B${editedRow}:G${editedRow}`).setValues([scaledRow]);
+  } else {
+    copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
+  }
   Logger.log("Done moving macros")
 }
 
@@ -449,4 +461,111 @@ function removeBlankRows(e) {
   Logger.log("bedtimetoend")
   consolidateRowsInMeal(bedtimeRow, totalRow-2);
   
+}
+
+const LLM_MODEL = "claude-opus-5-5";
+
+// Asks Claude which row of the Foods tab the entered text refers to.
+// Returns {row, amount}: row is the 0-indexed row in data (-1 if no food matches), and amount is the
+// quantity typed, converted to the unit of that row's Amount (null if none was typed).
+// Returns null if the call failed.
+function chooseFoodWithLlm(enteredText, data) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("ANTHROPIC_API_KEY");
+  if (!apiKey) {
+    Logger.log("No ANTHROPIC_API_KEY script property set");
+    return null;
+  }
+  let foodList = "";
+  for (let i = 1; i < data.length; i++) { // Row 0 is the header
+    if (String(data[i][0]).trim() === "") continue;
+    foodList += i + ": " + data[i][0] + (data[i][1] ? " (" + data[i][1] + ")" : "") + " | " + data[i][2] + "\n";
+  }
+  const body = {
+    model: LLM_MODEL,
+    max_tokens: 4000,
+    fallbacks: "default",
+    output_config: {
+      effort: "low",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {
+            row: { type: "integer" },
+            amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+          },
+          required: ["row", "amount"],
+          additionalProperties: false
+        }
+      }
+    },
+    system: "You match what someone typed into their meal plan to the food they meant in their food list, and work out how much of it they had. " +
+      "Each line of the list is \"row: food name (brand) | serving amount\". The typed text may be abbreviated, misspelled, missing the brand, " +
+      "or worded differently from the list. Set row to the row number of the food they most likely meant, or -1 if nothing in the list is a plausible match. " +
+      "If the typed text includes a quantity, set amount to that quantity expressed in the unit of the chosen row's serving amount: a bare number " +
+      "means that unit already (\"popcorn 8\" with a serving of \"30g\" is 8), and a quantity in a different unit is converted (0.3 oz is 8.5 g). " +
+      "For count-based servings like \"1 Cup\" or \"7 Almonds\", give the number of those units. Use the food's typical density if a weight-volume " +
+      "conversion is needed. If the typed text has no quantity, set amount to null.",
+    messages: [{ role: "user", content: "Food list:\n" + foodList + "\nTyped text: " + enteredText }]
+  };
+  try {
+    const response = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+      method: "post",
+      contentType: "application/json",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "server-side-fallback-2026-07-01"
+      },
+      payload: JSON.stringify(body),
+      muteHttpExceptions: true
+    });
+    if (response.getResponseCode() !== 200) {
+      Logger.log("LLM call failed: " + response.getResponseCode() + " " + response.getContentText());
+      return null;
+    }
+    const message = JSON.parse(response.getContentText());
+    if (message.stop_reason === "refusal") {
+      Logger.log("LLM refused: " + JSON.stringify(message.stop_details));
+      return null;
+    }
+    const textBlock = message.content.find(b => b.type === "text");
+    const choice = JSON.parse(textBlock.text);
+    Logger.log("LLM chose row " + choice.row + " and amount " + choice.amount + " for: " + enteredText);
+    if (choice.row === -1) return { row: -1, amount: null };
+    if (!Number.isInteger(choice.row) || choice.row < 1 || choice.row >= data.length) return null;
+    const amount = typeof choice.amount === "number" && choice.amount > 0 ? choice.amount : null;
+    return { row: choice.row, amount: amount };
+  } catch (err) {
+    Logger.log("LLM call error: " + err);
+    return null;
+  }
+}
+
+// Takes a Foods row (Food, Brand, Amount, Protein, Carbs, Fat, ...) and returns its first six values with the
+// amount set to newNum (in the row's existing unit) and the macros scaled to match, the same way
+// changeMacrosBasedOnChangeToAmount does when the amount is edited. Returns null if the amount can't be scaled.
+function scaleFoodRow(foodRow, newNum) {
+  const oldVal = String(foodRow[2]);
+  if (oldVal.includes("/")) return null; // Fraction amounts aren't scaled, as in changeMacrosBasedOnChangeToAmount
+  const oldNum = parseFloat(oldVal);
+  if (isNaN(oldNum) || oldNum === 0) return null;
+  const unitChars = oldVal.match(/(?<=\d+)\D*$/) || "";
+  const multiplier = newNum / oldNum;
+  const row = foodRow.slice(0, 6);
+  row[2] = parseFloat(newNum.toFixed(2)) + unitChars;
+  for (let col = 3; col <= 5; col++) {
+    const macroVal = parseFloat(String(row[col]));
+    if (!isNaN(macroVal)) row[col] = parseFloat((macroVal * multiplier).toFixed(2));
+  }
+  Logger.log("Scaled " + row[0] + " from " + oldVal + " to " + row[2]);
+  return row;
+}
+
+// Run once from the editor to replace the simple onEdit trigger with an installable one.
+function installEditTrigger() {
+  for (const t of ScriptApp.getProjectTriggers()) {
+    if (t.getHandlerFunction() === "onEditInstalled") ScriptApp.deleteTrigger(t);
+  }
+  ScriptApp.newTrigger("onEditInstalled").forSpreadsheet(SpreadsheetApp.getActive()).onEdit().create();
 }
