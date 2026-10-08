@@ -780,7 +780,7 @@ function formatHistoryDate(value, timeZone) {
 // Meal Plan History spreadsheet, replacing any rows already saved for the same date.
 function saveDailySnapshot() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const timeZone = ss.getSpreadsheetTimeZone();
+  const timeZone = TIME_ZONE;
   const date = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd");
   const plan = ss.getSheetByName("Meal Plan").getDataRange().getValues();
   const rows = [];
@@ -801,9 +801,21 @@ function saveDailySnapshot() {
   Logger.log("Saved " + rows.length + " rows for " + date);
 }
 
+// When each meal starts (hour of the day, 24h) and a word that appears in its Meal Plan section name. Filling the
+// remaining calories favors foods usually eaten at the meal for the time the request is entered.
+const MEAL_START_HOURS = [[0, "dinner"], [4, "breakfast"], [12, "lunch"], [14, "afternoon"], [20, "dinner"]];
+const TIME_ZONE = "America/Denver"; // Mountain Time, for meal times and snapshot dates
+
+function mealForNow() {
+  const hour = parseInt(Utilities.formatDate(new Date(), TIME_ZONE, "H"), 10);
+  let meal = MEAL_START_HOURS[0][1];
+  for (const [startHour, name] of MEAL_START_HOURS) if (hour >= startHour) meal = name;
+  return meal;
+}
+
 // Fills what's left of the day (the Remainder row under the Target row: protein, carbs, fat and calories) with foods
-// eaten most often in the Meal Plan History and today's plan, plus foods on the "I like" lists below the Remainder row.
-// Starts at startRow and continues into the blank rows below it in the same meal.
+// usually eaten at the current meal (by time of day), drawn from the Meal Plan History, today's plan, and the
+// "I like" lists below the Remainder row. Starts at startRow and continues into the blank rows below it in the same meal.
 function fillRemainingCalories(ss, startRow, data) {
   const mealPlanSheet = ss.getSheetByName("Meal Plan");
   const plan = mealPlanSheet.getDataRange().getValues();
@@ -817,6 +829,8 @@ function fillRemainingCalories(ss, startRow, data) {
     Logger.log("No remaining calories to fill: " + remaining[3]);
     return;
   }
+  const timeZone = TIME_ZONE;
+  const meal = mealForNow();
   const foodIndex = {};
   function foodKey(food, brand) {
     return String(food).trim().toLowerCase() + "|" + String(brand).trim().toLowerCase();
@@ -825,34 +839,50 @@ function fillRemainingCalories(ss, startRow, data) {
     const key = foodKey(data[i][0], data[i][1]);
     if (!(key in foodIndex)) foodIndex[key] = i;
   }
-  // For each Foods row: the days it was eaten, the amounts, and whether it's on an "I like" list
+  // For each Foods row: the days it was eaten (at any meal, and at this meal), the amounts, and the "I like" lists it's on
   const stats = {};
   function statsFor(row) {
-    if (!stats[row]) stats[row] = { days: {}, amounts: [], liked: false };
+    if (!stats[row]) stats[row] = { days: {}, mealDays: {}, amounts: [], mealAmounts: [], liked: false, likedForMeal: false };
     return stats[row];
   }
-  function countFood(day, food, brand, amount) {
+  function countFood(day, mealLabel, food, brand, amount) {
     const row = foodIndex[foodKey(food, brand)];
     if (row === undefined) return;
     const s = statsFor(row);
+    const atThisMeal = String(mealLabel).toLowerCase().includes(meal);
     s.days[day] = true;
-    if (String(amount).trim() !== "") s.amounts.push(String(amount));
+    if (atThisMeal) s.mealDays[day] = true;
+    if (String(amount).trim() === "") return;
+    s.amounts.push(String(amount));
+    if (atThisMeal) s.mealAmounts.push(String(amount));
   }
-  const timeZone = ss.getSpreadsheetTimeZone();
   const historySheet = getHistorySheet(false);
   if (historySheet !== null) {
     const history = historySheet.getDataRange().getValues();
-    for (let i = 1; i < history.length; i++) countFood(formatHistoryDate(history[i][0], timeZone), history[i][2], history[i][3], history[i][4]);
+    for (let i = 1; i < history.length; i++) {
+      countFood(formatHistoryDate(history[i][0], timeZone), history[i][1], history[i][2], history[i][3], history[i][4]);
+    }
   }
-  for (const { values: r } of mealSectionRows(plan)) countFood("today", r[1], r[2], r[3]);
+  for (const { meal: mealLabel, values: r } of mealSectionRows(plan)) countFood("today", mealLabel, r[1], r[2], r[3]);
+  let likedListForMeal = false;
   for (let i = remainderIndex + 1; i < plan.length; i++) {
+    const text = String(plan[i][1]).trim();
+    if (/i like:?$/i.test(text)) { // A list heading like "Breakfast I like:"
+      likedListForMeal = text.toLowerCase().includes(meal);
+      continue;
+    }
     const row = foodIndex[foodKey(plan[i][1], plan[i][2])];
     if (row === undefined) continue;
     const s = statsFor(row);
     s.liked = true;
-    if (String(plan[i][3]).trim() !== "") s.amounts.push(String(plan[i][3]));
+    if (likedListForMeal) s.likedForMeal = true;
+    if (String(plan[i][3]).trim() !== "") (likedListForMeal ? s.mealAmounts : s.amounts).push(String(plan[i][3]));
   }
-  const score = row => Object.keys(stats[row].days).length + (stats[row].liked ? 1 : 0);
+  const count = obj => Object.keys(obj).length;
+  const score = row => {
+    const s = stats[row];
+    return 3 * count(s.mealDays) + (s.likedForMeal ? 3 : 0) + count(s.days) + (s.liked ? 1 : 0);
+  };
   const candidates = Object.keys(stats).map(Number).sort((a, b) => score(b) - score(a)).slice(0, 40);
   if (candidates.length === 0) {
     Logger.log("No frequently eaten or liked foods found to fill with");
@@ -861,9 +891,12 @@ function fillRemainingCalories(ss, startRow, data) {
   let candidateList = "";
   for (const i of candidates) {
     const d = data[i];
+    const s = stats[i];
+    const usual = (s.mealAmounts.length > 0 ? s.mealAmounts : s.amounts).slice(-3).join(", ");
     candidateList += i + ": " + d[0] + (d[1] ? " (" + d[1] + ")" : "") + " | serving " + d[2] + " | P/C/F " + d[3] + "/" + d[4] + "/" + d[5] +
-      " | " + d[6] + " kcal per serving | eaten on " + Object.keys(stats[i].days).length + " days" +
-      (stats[i].liked ? " | on their 'I like' lists" : "") + " | usual amounts: " + stats[i].amounts.slice(-3).join(", ") + "\n";
+      " | " + d[6] + " kcal per serving | eaten at " + meal + " on " + count(s.mealDays) + " days, at any meal on " + count(s.days) + " days" +
+      (s.likedForMeal ? " | on their " + meal + " 'I like' list" : s.liked ? " | on an 'I like' list for another meal" : "") +
+      " | usual amounts: " + usual + "\n";
   }
   const result = callClaudeForJson({
     model: LLM_MODEL,
@@ -894,16 +927,17 @@ function fillRemainingCalories(ss, startRow, data) {
     system: "You plan the rest of someone's day of eating while they are on a calorie-controlled cut. Choose 2 to 5 foods from the candidates, " +
       "with amounts, so that what you add fits what they have left for the day: land as close as possible to the remaining calories (aim for " +
       "within 25 kcal and never more than 50 over), then get as close as you can to the remaining protein, carbs and fat (a negative number means " +
-      "they're already over, so keep that macro low). Prefer foods they eat often or have on their 'I like' lists, combinations they'd plausibly eat " +
-      "together at this point in the day, and realistic portions close to their usual amounts. Each candidate line is " +
-      "\"row: food (brand) | serving | P/C/F per serving | kcal per serving | days eaten | (on their 'I like' lists) | usual amounts\". " +
+      "they're already over, so keep that macro low). Strongly favor foods they usually eat at the current meal (eaten at that meal on many days, " +
+      "or on their 'I like' list for that meal), and only reach for foods from other meals if those can't fit. Choose combinations they'd " +
+      "plausibly eat together at that meal, with realistic portions close to their usual amounts. Each candidate line is " +
+      "\"row: food (brand) | serving | P/C/F per serving | kcal per serving | days eaten at this meal and at any meal | 'I like' lists | usual amounts\". " +
       "Give amount in the unit of the serving: grams if the serving is in grams, or a count of units for servings like \"1 Scoop\" or " +
       "\"7 Almonds\". A food's calories and macros are amount / (the serving's number) × the per-serving values. Add up your totals before " +
       "answering and adjust the amounts until they fit.",
     messages: [{
       role: "user",
-      content: "Remaining for today: " + remaining[3] + " kcal, protein " + remaining[0] + " g, carbs " + remaining[1] + " g, fat " + remaining[2] + " g" +
-        "\nCandidate foods:\n" + candidateList
+      content: "Current meal: " + meal + "\nRemaining for today: " + remaining[3] + " kcal, protein " + remaining[0] + " g, carbs " + remaining[1] +
+        " g, fat " + remaining[2] + " g\nCandidate foods:\n" + candidateList
     }]
   });
   if (result === null || !Array.isArray(result.items)) return;
@@ -917,7 +951,7 @@ function fillRemainingCalories(ss, startRow, data) {
     for (let m = 0; m < 3; m++) added[m] += parseFloat(row[3 + m]) || 0;
     mealRows.push(row);
   }
-  Logger.log("Filling " + remaining.join("/") + " (P/C/F/kcal) with " + added.map(x => x.toFixed(1)).join("/") + "/" +
+  Logger.log("Filling " + meal + " with " + remaining.join("/") + " left (P/C/F/kcal); adding " + added.map(x => x.toFixed(1)).join("/") + "/" +
     Math.round(added[0] * 4 + added[1] * 4 + added[2] * 9) + ": " + JSON.stringify(mealRows));
   writeRowsIntoMeal(mealPlanSheet, startRow, mealRows);
 }
