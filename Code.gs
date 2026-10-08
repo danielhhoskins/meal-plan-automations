@@ -307,32 +307,62 @@ function searchForFoodAndFillRow(e) {
     return;
   }
   let data = ss.getSheetByName("Foods").getDataRange().getValues();
-  let llmChoice = chooseFoodWithLlm(String(e.range.getValue()), data);
-  if (llmChoice !== null && llmChoice.row === -1) { // Not in Foods: look it up online and add it
-    const newFood = lookUpNewFoodWithLlm(String(e.range.getValue()));
-    if (newFood === null) {
-      Logger.log("No food added for: " + enteredStr);
-      return;
-    }
-    let lastFoodRow = data.length;
-    while (lastFoodRow > 1 && String(data[lastFoodRow - 1][0]).trim() === "") lastFoodRow--;
-    const newRowNum = lastFoodRow + 1;
-    const foodRow = [newFood.food, newFood.brand, newFood.serving, newFood.protein, newFood.carbs, newFood.fat];
-    ss.getSheetByName("Foods").getRange(newRowNum, 1, 1, 7)
-      .setValues([foodRow.concat([`=D${newRowNum}*4+E${newRowNum}*4+F${newRowNum}*9`])]);
-    Logger.log("Added " + newFood.food + " to Foods row " + newRowNum);
-    const scaledNewRow = newFood.amount !== null ? scaleFoodRow(foodRow, newFood.amount) : null;
-    ss.getRange(`Meal Plan!B${editedRow}:G${editedRow}`).setValues([scaledNewRow !== null ? scaledNewRow : foodRow]);
+  const items = chooseFoodsWithLlm(String(e.range.getValue()), data);
+  if (items === null) { // LLM call failed: use the old algorithm
+    let matchedRowIndex = getBestMatch(enteredStr, e);
+    copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
+    Logger.log("Done moving macros")
     return;
   }
-  let matchedRowIndex = llmChoice !== null ? llmChoice.row : getBestMatch(enteredStr, e); // LLM call failed: use the old algorithm
-  let scaledRow = llmChoice !== null && llmChoice.amount !== null ? scaleFoodRow(data[matchedRowIndex], llmChoice.amount) : null;
-  if (scaledRow !== null) { // Write the already-scaled row in one go so the Foods amount never shows
-    ss.getRange(`Meal Plan!B${editedRow}:G${editedRow}`).setValues([scaledRow]);
-  } else {
-    copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
+  if (items.length === 0) {
+    Logger.log("LLM found no food in: " + enteredStr);
+    return;
   }
-  Logger.log("Done moving macros")
+  const foodsSheet = ss.getSheetByName("Foods");
+  let nextFoodsRow = data.length;
+  while (nextFoodsRow > 1 && String(data[nextFoodsRow - 1][0]).trim() === "") nextFoodsRow--;
+  nextFoodsRow++;
+  const mealRows = [];
+  for (const item of items) {
+    let foodRow, amount;
+    if (item.row !== -1) {
+      foodRow = data[item.row].slice(0, 6);
+      amount = item.amount;
+    } else { // Not in Foods: look it up online and add it
+      const newFood = lookUpNewFoodWithLlm(item.text);
+      if (newFood === null) {
+        Logger.log("No food added for: " + item.text);
+        continue;
+      }
+      foodRow = [newFood.food, newFood.brand, newFood.serving, newFood.protein, newFood.carbs, newFood.fat];
+      foodsSheet.getRange(nextFoodsRow, 1, 1, 7)
+        .setValues([foodRow.concat([`=D${nextFoodsRow}*4+E${nextFoodsRow}*4+F${nextFoodsRow}*9`])]);
+      Logger.log("Added " + newFood.food + " to Foods row " + nextFoodsRow);
+      nextFoodsRow++;
+      amount = newFood.amount;
+    }
+    const scaledRow = amount !== null ? scaleFoodRow(foodRow, amount) : null; // Scaled before writing so the Foods amount never shows
+    mealRows.push(scaledRow !== null ? scaledRow : foodRow);
+  }
+  // The first food goes in the edited row and the rest in the blank rows below it in the same meal
+  const mealPlanSheet2 = ss.getSheetByName("Meal Plan");
+  const targetRows = [editedRow];
+  const lastRow = mealPlanSheet2.getLastRow();
+  if (mealRows.length > 1 && lastRow > editedRow) {
+    const below = mealPlanSheet2.getRange(editedRow + 1, 1, lastRow - editedRow, 7).getValues();
+    for (let i = 0; i < below.length && targetRows.length < mealRows.length; i++) {
+      if (String(below[i][0]).trim() !== "") break; // Column A marks the Meal Total row or the next meal
+      if (below[i].slice(1, 7).every(x => String(x).trim() === "")) targetRows.push(editedRow + 1 + i);
+    }
+  }
+  for (let i = 0; i < mealRows.length; i++) {
+    if (i >= targetRows.length) {
+      Logger.log("No blank row left in this meal for: " + mealRows[i][0]);
+      continue;
+    }
+    mealPlanSheet2.getRange(targetRows[i], 2, 1, 6).setValues([mealRows[i]]);
+  }
+
 }
 
 function clearRow(rowNumberOneIndexed) {
@@ -524,19 +554,19 @@ function callClaudeForJson(body) {
   }
 }
 
-// Asks Claude which row of the Foods tab the entered text refers to.
-// Returns {row, amount}: row is the 0-indexed row in data (-1 if no food matches), and amount is the
-// quantity typed, converted to the unit of that row's Amount (null if none was typed).
-// Returns null if the call failed.
-function chooseFoodWithLlm(enteredText, data) {
+// Asks Claude which foods the entered text describes. A single entry can describe several foods (e.g. a
+// sandwich), so this returns a list of {row, text, amount}: row is the 0-indexed row in data (-1 if the food
+// isn't in Foods), text describes that one food for an online lookup, and amount is its quantity in the unit
+// of that row's Amount (null to use the Foods amount). Returns [] if the text names no food, or null if the call failed.
+function chooseFoodsWithLlm(enteredText, data) {
   let foodList = "";
   for (let i = 1; i < data.length; i++) { // Row 0 is the header
     if (String(data[i][0]).trim() === "") continue;
     foodList += i + ": " + data[i][0] + (data[i][1] ? " (" + data[i][1] + ")" : "") + " | " + data[i][2] + "\n";
   }
-  const choice = callClaudeForJson({
+  const result = callClaudeForJson({
     model: LLM_MODEL,
-    max_tokens: 4000,
+    max_tokens: 8000,
     fallbacks: "default",
     output_config: {
       effort: "low",
@@ -545,34 +575,64 @@ function chooseFoodWithLlm(enteredText, data) {
         schema: {
           type: "object",
           properties: {
-            row: { type: "integer" },
-            amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  row: { type: "integer" },
+                  text: { type: "string" },
+                  amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+                },
+                required: ["row", "text", "amount"],
+                additionalProperties: false
+              }
+            }
           },
-          required: ["row", "amount"],
+          required: ["items"],
           additionalProperties: false
         }
       }
     },
-    system: "You match what someone typed into their meal plan to the food they meant in their food list, and work out how much of it they had. " +
+    system: "You turn what someone typed into their meal plan into the foods to log from their food list, with how much of each they had. " +
       "Each line of the list is \"row: food name (brand) | serving amount\". The typed text may be abbreviated, misspelled, missing the brand, " +
-      "or worded differently from the list. Set row to the row number of the food they most likely meant, or -1 if nothing in the list is a plausible match. " +
-      "If the typed text includes a quantity, set amount to that quantity expressed in the unit of the chosen row's serving amount: a bare number " +
-      "means that unit already (\"popcorn 8\" with a serving of \"30g\" is 8), and a quantity in a different unit is converted (0.3 oz is 8.5 g). " +
-      "For count-based servings like \"1 Cup\" or \"7 Almonds\", give the number of those units. Use the food's typical density if a weight-volume " +
-      "conversion is needed. If the typed text has no quantity, set amount to null.",
+      "or worded differently from the list. It may name one food, or something made of several foods (e.g. \"half pb sandwich\" is bread " +
+      "plus peanut butter); return one item per separate food, in the order they'd be logged. " +
+      "For each item, set row to the row number of the list food it most likely is, or -1 if nothing in the list is a plausible match. " +
+      "If the typed text names a brand, store or restaurant for a food, only match a list item from that same brand (or one with no brand that is " +
+      "clearly the same product); a similar food from a different brand is not a match, so use -1. " +
+      "Set text to a short description of that one food on its own, including its brand, its quantity, and any instruction that applies to it such as " +
+      "\"conservative estimate\" (it is used to look the food up online when row is -1). " +
+      "Set amount to the item's quantity expressed in the unit of the chosen row's serving amount: a bare number means that unit already " +
+      "(\"popcorn 8\" with a serving of \"30g\" is 8), and a quantity in a different unit is converted (0.3 oz is 8.5 g). For count-based servings " +
+      "like \"1 Cup\" or \"7 Almonds\", give the number of those units, and use the food's typical density if a weight-volume conversion is needed. " +
+      "If a single food is typed on its own with no quantity, set amount to null. For each part of a combined item (like the bread and peanut butter " +
+      "in a sandwich), always set amount: use the quantity typed for that part, or estimate a typical one (the bread in half a sandwich is one slice). " +
+      "Amount must always be in the unit of the row's serving amount, so if the serving is \"1g\" or \"100g\", amount is a number of grams " +
+      "(one slice of whole wheat bread is about 40, not 1); only count-based servings like \"1 slice\" take a count. When row is -1, set amount to null. " +
+      "If the typed text is gibberish or names no food, return an empty items list.",
     messages: [{ role: "user", content: "Food list:\n" + foodList + "\nTyped text: " + enteredText }]
   });
-  if (choice === null) return null;
-  Logger.log("LLM chose row " + choice.row + " and amount " + choice.amount + " for: " + enteredText);
-  if (choice.row === -1) return { row: -1, amount: null };
-  if (!Number.isInteger(choice.row) || choice.row < 1 || choice.row >= data.length) return null;
-  const amount = typeof choice.amount === "number" && choice.amount > 0 ? choice.amount : null;
-  return { row: choice.row, amount: amount };
+  if (result === null || !Array.isArray(result.items)) return null;
+  Logger.log("LLM chose " + JSON.stringify(result.items) + " for: " + enteredText);
+  const items = [];
+  for (const item of result.items) {
+    if (item.row === -1) {
+      items.push({ row: -1, text: String(item.text), amount: null });
+    } else if (Number.isInteger(item.row) && item.row >= 1 && item.row < data.length) {
+      const amount = typeof item.amount === "number" && item.amount > 0 ? item.amount : null;
+      items.push({ row: item.row, text: String(item.text), amount: amount });
+    }
+  }
+  return items;
 }
+
+const CONSERVATIVE_MACRO_FACTOR = 0.7; // Asking for a conservative estimate cuts the looked-up macros by 30%
 
 // For a food that isn't in the Foods tab, has Claude search the web for its nutrition facts.
 // Returns {food, brand, serving, protein, carbs, fat, amount} (amount is the typed quantity in the
 // serving's unit, or null), or null if the text isn't a recognizable food or the call failed.
+// If the typed text asks for a conservative estimate, the macros are multiplied by CONSERVATIVE_MACRO_FACTOR.
 function lookUpNewFoodWithLlm(enteredText) {
   const result = callClaudeForJson({
     model: LLM_MODEL,
@@ -592,9 +652,10 @@ function lookUpNewFoodWithLlm(enteredText) {
             protein: { type: "number" },
             carbs: { type: "number" },
             fat: { type: "number" },
-            amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+            amount: { anyOf: [{ type: "number" }, { type: "null" }] },
+            conservative: { type: "boolean" }
           },
-          required: ["is_food", "food", "brand", "serving", "protein", "carbs", "fat", "amount"],
+          required: ["is_food", "food", "brand", "serving", "protein", "carbs", "fat", "amount", "conservative"],
           additionalProperties: false
         }
       }
@@ -609,16 +670,24 @@ function lookUpNewFoodWithLlm(enteredText) {
       "Choose a sensible serving: the package or menu serving for branded and restaurant items, or a gram weight such as 100g for generic foods. " +
       "Write serving like the existing list does, e.g. \"28g\", \"1 Bowl\", \"150 mL\", \"7 Almonds\". Give protein, carbs and fat in grams for that serving. " +
       "If the typed text includes a quantity, set amount to that quantity expressed in the serving's unit (a bare number means grams for foods " +
-      "measured by weight); otherwise set amount to null.",
+      "measured by weight); otherwise set amount to null. " +
+      "Set conservative to true if the typed text asks for a conservative estimate (e.g. \"conservative\", \"be conservative\", \"cons est\"), " +
+      "otherwise false. Don't treat that request as part of the food's name, and report the nutrition facts as you found them; " +
+      "the adjustment is applied afterwards.",
     messages: [{ role: "user", content: "Typed text: " + enteredText }]
   });
   if (result === null) return null;
   Logger.log("New food lookup for " + enteredText + ": " + JSON.stringify(result));
   if (!result.is_food || String(result.food).trim() === "" || isNaN(parseFloat(result.serving))) return null;
   const amount = typeof result.amount === "number" && result.amount > 0 ? result.amount : null;
+  const factor = result.conservative === true ? CONSERVATIVE_MACRO_FACTOR : 1;
+  if (factor !== 1) Logger.log("Conservative estimate requested: multiplying macros by " + factor);
   return {
     food: result.food, brand: result.brand, serving: result.serving,
-    protein: result.protein, carbs: result.carbs, fat: result.fat, amount: amount
+    protein: parseFloat((result.protein * factor).toFixed(2)),
+    carbs: parseFloat((result.carbs * factor).toFixed(2)),
+    fat: parseFloat((result.fat * factor).toFixed(2)),
+    amount: amount
   };
 }
 
