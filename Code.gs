@@ -328,6 +328,7 @@ function searchForFoodAndFillRow(e) {
   while (nextFoodsRow > 1 && String(data[nextFoodsRow - 1][0]).trim() === "") nextFoodsRow--;
   nextFoodsRow++;
   const mealRows = [];
+  const restIndexes = []; // Foods to size so this entry uses up the rest of the day's calories
   for (const item of items) {
     let foodRow, amount;
     if (item.row !== -1) {
@@ -346,9 +347,11 @@ function searchForFoodAndFillRow(e) {
       nextFoodsRow++;
       amount = newFood.amount;
     }
-    const scaledRow = amount !== null ? scaleFoodRow(foodRow, amount) : null; // Scaled before writing so the Foods amount never shows
+    const scaledRow = !item.restOfCalories && amount !== null ? scaleFoodRow(foodRow, amount) : null; // Scaled before writing so the Foods amount never shows
     mealRows.push(scaledRow !== null ? scaledRow : foodRow);
+    if (item.restOfCalories) restIndexes.push(mealRows.length - 1);
   }
+  if (restIndexes.length > 0) sizeToRestOfCalories(ss, mealRows, restIndexes);
   writeRowsIntoMeal(ss.getSheetByName("Meal Plan"), editedRow, mealRows);
 
 }
@@ -571,9 +574,10 @@ function chooseFoodsWithLlm(enteredText, data) {
                 properties: {
                   row: { type: "integer" },
                   text: { type: "string" },
-                  amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+                  amount: { anyOf: [{ type: "number" }, { type: "null" }] },
+                  rest_of_calories: { type: "boolean" }
                 },
-                required: ["row", "text", "amount"],
+                required: ["row", "text", "amount", "rest_of_calories"],
                 additionalProperties: false
               }
             },
@@ -600,6 +604,8 @@ function chooseFoodsWithLlm(enteredText, data) {
       "in a sandwich), always set amount: use the quantity typed for that part, or estimate a typical one (the bread in half a sandwich is one slice). " +
       "Amount must always be in the unit of the row's serving amount, so if the serving is \"1g\" or \"100g\", amount is a number of grams " +
       "(one slice of whole wheat bread is about 40, not 1); only count-based servings like \"1 slice\" take a count. When row is -1, set amount to null. " +
+      "If the typed text says to use the rest of their calories on a food (e.g. \"parm cutlet rest of my cals\"), set rest_of_calories to true " +
+      "for that item and amount to null; the amount is worked out afterwards. Otherwise set rest_of_calories to false. " +
       "If the typed text is gibberish or names no food, return an empty items list. " +
       "If instead the typed text asks you to fill the rest of the day's calories (e.g. \"fill my remaining cals with some foods i like\"), " +
       "set fill_remaining to true and return an empty items list; otherwise set fill_remaining to false.",
@@ -610,10 +616,10 @@ function chooseFoodsWithLlm(enteredText, data) {
   const items = [];
   for (const item of result.items) {
     if (item.row === -1) {
-      items.push({ row: -1, text: String(item.text), amount: null });
+      items.push({ row: -1, text: String(item.text), amount: null, restOfCalories: item.rest_of_calories === true });
     } else if (Number.isInteger(item.row) && item.row >= 1 && item.row < data.length) {
       const amount = typeof item.amount === "number" && item.amount > 0 ? item.amount : null;
-      items.push({ row: item.row, text: String(item.text), amount: amount });
+      items.push({ row: item.row, text: String(item.text), amount: amount, restOfCalories: item.rest_of_calories === true });
     }
   }
   return { fillRemaining: result.fill_remaining === true, items: items };
@@ -954,4 +960,30 @@ function fillRemainingCalories(ss, startRow, data) {
   Logger.log("Filling " + meal + " with " + remaining.join("/") + " left (P/C/F/kcal); adding " + added.map(x => x.toFixed(1)).join("/") + "/" +
     Math.round(added[0] * 4 + added[1] * 4 + added[2] * 9) + ": " + JSON.stringify(mealRows));
   writeRowsIntoMeal(mealPlanSheet, startRow, mealRows);
+}
+
+const kcalOf = row => (parseFloat(row[3]) || 0) * 4 + (parseFloat(row[4]) || 0) * 4 + (parseFloat(row[5]) || 0) * 9;
+
+// Sets the amounts of the foods at restIndexes in mealRows (Foods rows at their listed serving) so that this entry uses up
+// the day's remaining calories from the Remainder row, after the other foods in the entry. Split evenly if there are several.
+function sizeToRestOfCalories(ss, mealRows, restIndexes) {
+  const plan = ss.getSheetByName("Meal Plan").getDataRange().getValues();
+  const remainder = plan.find(r => String(r[0]).trim() === "Remainder");
+  let target = remainder ? parseFloat(remainder[7]) : NaN;
+  mealRows.forEach((row, i) => { if (!restIndexes.includes(i)) target -= kcalOf(row); });
+  if (isNaN(target) || target <= 0) {
+    Logger.log("No calories left to fill with: " + target);
+    return;
+  }
+  for (const i of restIndexes) {
+    const foodRow = mealRows[i];
+    const servingNum = parseFloat(String(foodRow[2]));
+    const perServing = kcalOf(foodRow);
+    if (isNaN(servingNum) || perServing <= 0) continue;
+    let amount = target / restIndexes.length / perServing * servingNum;
+    amount = /^\s*[\d.]+\s*(g|ml)\s*$/i.test(String(foodRow[2])) ? Math.round(amount) : Math.round(amount * 10) / 10;
+    const scaledRow = scaleFoodRow(foodRow, amount);
+    if (scaledRow !== null) mealRows[i] = scaledRow;
+  }
+  Logger.log("Sized to the rest of the day's " + Math.round(target) + " kcal: " + JSON.stringify(restIndexes.map(i => mealRows[i])));
 }
