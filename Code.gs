@@ -308,8 +308,21 @@ function searchForFoodAndFillRow(e) {
   }
   let data = ss.getSheetByName("Foods").getDataRange().getValues();
   let llmChoice = chooseFoodWithLlm(String(e.range.getValue()), data);
-  if (llmChoice !== null && llmChoice.row === -1) {
-    Logger.log("LLM found no matching food for: " + enteredStr);
+  if (llmChoice !== null && llmChoice.row === -1) { // Not in Foods: look it up online and add it
+    const newFood = lookUpNewFoodWithLlm(String(e.range.getValue()));
+    if (newFood === null) {
+      Logger.log("No food added for: " + enteredStr);
+      return;
+    }
+    let lastFoodRow = data.length;
+    while (lastFoodRow > 1 && String(data[lastFoodRow - 1][0]).trim() === "") lastFoodRow--;
+    const newRowNum = lastFoodRow + 1;
+    const foodRow = [newFood.food, newFood.brand, newFood.serving, newFood.protein, newFood.carbs, newFood.fat];
+    ss.getSheetByName("Foods").getRange(newRowNum, 1, 1, 7)
+      .setValues([foodRow.concat([`=D${newRowNum}*4+E${newRowNum}*4+F${newRowNum}*9`])]);
+    Logger.log("Added " + newFood.food + " to Foods row " + newRowNum);
+    const scaledNewRow = newFood.amount !== null ? scaleFoodRow(foodRow, newFood.amount) : null;
+    ss.getRange(`Meal Plan!B${editedRow}:G${editedRow}`).setValues([scaledNewRow !== null ? scaledNewRow : foodRow]);
     return;
   }
   let matchedRowIndex = llmChoice !== null ? llmChoice.row : getBestMatch(enteredStr, e); // LLM call failed: use the old algorithm
@@ -465,22 +478,63 @@ function removeBlankRows(e) {
 
 const LLM_MODEL = "claude-opus-5-5";
 
-// Asks Claude which row of the Foods tab the entered text refers to.
-// Returns {row, amount}: row is the 0-indexed row in data (-1 if no food matches), and amount is the
-// quantity typed, converted to the unit of that row's Amount (null if none was typed).
-// Returns null if the call failed.
-function chooseFoodWithLlm(enteredText, data) {
+// Sends a Messages API request and returns the JSON object in Claude's final text block, or null if the
+// call failed. Continues the request if a web search pauses the turn (stop_reason "pause_turn").
+function callClaudeForJson(body) {
   const apiKey = PropertiesService.getScriptProperties().getProperty("ANTHROPIC_API_KEY");
   if (!apiKey) {
     Logger.log("No ANTHROPIC_API_KEY script property set");
     return null;
   }
+  const messages = body.messages.slice();
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const response = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+        method: "post",
+        contentType: "application/json",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "server-side-fallback-2026-07-01"
+        },
+        payload: JSON.stringify(Object.assign({}, body, { messages: messages })),
+        muteHttpExceptions: true
+      });
+      if (response.getResponseCode() !== 200) {
+        Logger.log("LLM call failed: " + response.getResponseCode() + " " + response.getContentText());
+        return null;
+      }
+      const message = JSON.parse(response.getContentText());
+      if (message.stop_reason === "pause_turn") {
+        messages.push({ role: "assistant", content: message.content });
+        continue;
+      }
+      if (message.stop_reason === "refusal") {
+        Logger.log("LLM refused: " + JSON.stringify(message.stop_details));
+        return null;
+      }
+      const textBlocks = message.content.filter(b => b.type === "text");
+      return JSON.parse(textBlocks[textBlocks.length - 1].text);
+    }
+    Logger.log("LLM call kept pausing; giving up");
+    return null;
+  } catch (err) {
+    Logger.log("LLM call error: " + err);
+    return null;
+  }
+}
+
+// Asks Claude which row of the Foods tab the entered text refers to.
+// Returns {row, amount}: row is the 0-indexed row in data (-1 if no food matches), and amount is the
+// quantity typed, converted to the unit of that row's Amount (null if none was typed).
+// Returns null if the call failed.
+function chooseFoodWithLlm(enteredText, data) {
   let foodList = "";
   for (let i = 1; i < data.length; i++) { // Row 0 is the header
     if (String(data[i][0]).trim() === "") continue;
     foodList += i + ": " + data[i][0] + (data[i][1] ? " (" + data[i][1] + ")" : "") + " | " + data[i][2] + "\n";
   }
-  const body = {
+  const choice = callClaudeForJson({
     model: LLM_MODEL,
     max_tokens: 4000,
     fallbacks: "default",
@@ -507,39 +561,65 @@ function chooseFoodWithLlm(enteredText, data) {
       "For count-based servings like \"1 Cup\" or \"7 Almonds\", give the number of those units. Use the food's typical density if a weight-volume " +
       "conversion is needed. If the typed text has no quantity, set amount to null.",
     messages: [{ role: "user", content: "Food list:\n" + foodList + "\nTyped text: " + enteredText }]
+  });
+  if (choice === null) return null;
+  Logger.log("LLM chose row " + choice.row + " and amount " + choice.amount + " for: " + enteredText);
+  if (choice.row === -1) return { row: -1, amount: null };
+  if (!Number.isInteger(choice.row) || choice.row < 1 || choice.row >= data.length) return null;
+  const amount = typeof choice.amount === "number" && choice.amount > 0 ? choice.amount : null;
+  return { row: choice.row, amount: amount };
+}
+
+// For a food that isn't in the Foods tab, has Claude search the web for its nutrition facts.
+// Returns {food, brand, serving, protein, carbs, fat, amount} (amount is the typed quantity in the
+// serving's unit, or null), or null if the text isn't a recognizable food or the call failed.
+function lookUpNewFoodWithLlm(enteredText) {
+  const result = callClaudeForJson({
+    model: LLM_MODEL,
+    max_tokens: 16000,
+    fallbacks: "default",
+    output_config: {
+      effort: "high",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {
+            is_food: { type: "boolean" },
+            food: { type: "string" },
+            brand: { type: "string" },
+            serving: { type: "string" },
+            protein: { type: "number" },
+            carbs: { type: "number" },
+            fat: { type: "number" },
+            amount: { anyOf: [{ type: "number" }, { type: "null" }] }
+          },
+          required: ["is_food", "food", "brand", "serving", "protein", "carbs", "fat", "amount"],
+          additionalProperties: false
+        }
+      }
+    },
+    tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }],
+    system: "You estimate nutrition facts for a food someone typed into their meal plan, so it can be added to their food list. " +
+      "First decide whether the typed text names a recognizable food or drink (a generic food, a dish, or a branded or restaurant product). " +
+      "If it is gibberish or not a food, set is_food to false and leave the other fields empty or zero. " +
+      "Otherwise you must use web search before answering, even if you think you know the numbers. Look up reliable nutrition facts " +
+      "(the brand's or restaurant's own nutrition info first, then USDA or another reputable database) and give your best estimate. " +
+      "Use a clear, specific food name (title case, without the brand) and the brand if there is one, or an empty string. " +
+      "Choose a sensible serving: the package or menu serving for branded and restaurant items, or a gram weight such as 100g for generic foods. " +
+      "Write serving like the existing list does, e.g. \"28g\", \"1 Bowl\", \"150 mL\", \"7 Almonds\". Give protein, carbs and fat in grams for that serving. " +
+      "If the typed text includes a quantity, set amount to that quantity expressed in the serving's unit (a bare number means grams for foods " +
+      "measured by weight); otherwise set amount to null.",
+    messages: [{ role: "user", content: "Typed text: " + enteredText }]
+  });
+  if (result === null) return null;
+  Logger.log("New food lookup for " + enteredText + ": " + JSON.stringify(result));
+  if (!result.is_food || String(result.food).trim() === "" || isNaN(parseFloat(result.serving))) return null;
+  const amount = typeof result.amount === "number" && result.amount > 0 ? result.amount : null;
+  return {
+    food: result.food, brand: result.brand, serving: result.serving,
+    protein: result.protein, carbs: result.carbs, fat: result.fat, amount: amount
   };
-  try {
-    const response = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
-      method: "post",
-      contentType: "application/json",
-      headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "server-side-fallback-2026-07-01"
-      },
-      payload: JSON.stringify(body),
-      muteHttpExceptions: true
-    });
-    if (response.getResponseCode() !== 200) {
-      Logger.log("LLM call failed: " + response.getResponseCode() + " " + response.getContentText());
-      return null;
-    }
-    const message = JSON.parse(response.getContentText());
-    if (message.stop_reason === "refusal") {
-      Logger.log("LLM refused: " + JSON.stringify(message.stop_details));
-      return null;
-    }
-    const textBlock = message.content.find(b => b.type === "text");
-    const choice = JSON.parse(textBlock.text);
-    Logger.log("LLM chose row " + choice.row + " and amount " + choice.amount + " for: " + enteredText);
-    if (choice.row === -1) return { row: -1, amount: null };
-    if (!Number.isInteger(choice.row) || choice.row < 1 || choice.row >= data.length) return null;
-    const amount = typeof choice.amount === "number" && choice.amount > 0 ? choice.amount : null;
-    return { row: choice.row, amount: amount };
-  } catch (err) {
-    Logger.log("LLM call error: " + err);
-    return null;
-  }
 }
 
 // Takes a Foods row (Food, Brand, Amount, Protein, Carbs, Fat, ...) and returns its first six values with the
