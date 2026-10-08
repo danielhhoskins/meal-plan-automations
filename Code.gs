@@ -307,13 +307,18 @@ function searchForFoodAndFillRow(e) {
     return;
   }
   let data = ss.getSheetByName("Foods").getDataRange().getValues();
-  const items = chooseFoodsWithLlm(String(e.range.getValue()), data);
-  if (items === null) { // LLM call failed: use the old algorithm
+  const choice = chooseFoodsWithLlm(String(e.range.getValue()), data);
+  if (choice === null) { // LLM call failed: use the old algorithm
     let matchedRowIndex = getBestMatch(enteredStr, e);
     copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
     Logger.log("Done moving macros")
     return;
   }
+  if (choice.fillRemaining) {
+    fillRemainingCalories(ss, editedRow, data);
+    return;
+  }
+  const items = choice.items;
   if (items.length === 0) {
     Logger.log("LLM found no food in: " + enteredStr);
     return;
@@ -344,24 +349,7 @@ function searchForFoodAndFillRow(e) {
     const scaledRow = amount !== null ? scaleFoodRow(foodRow, amount) : null; // Scaled before writing so the Foods amount never shows
     mealRows.push(scaledRow !== null ? scaledRow : foodRow);
   }
-  // The first food goes in the edited row and the rest in the blank rows below it in the same meal
-  const mealPlanSheet2 = ss.getSheetByName("Meal Plan");
-  const targetRows = [editedRow];
-  const lastRow = mealPlanSheet2.getLastRow();
-  if (mealRows.length > 1 && lastRow > editedRow) {
-    const below = mealPlanSheet2.getRange(editedRow + 1, 1, lastRow - editedRow, 7).getValues();
-    for (let i = 0; i < below.length && targetRows.length < mealRows.length; i++) {
-      if (String(below[i][0]).trim() !== "") break; // Column A marks the Meal Total row or the next meal
-      if (below[i].slice(1, 7).every(x => String(x).trim() === "")) targetRows.push(editedRow + 1 + i);
-    }
-  }
-  for (let i = 0; i < mealRows.length; i++) {
-    if (i >= targetRows.length) {
-      Logger.log("No blank row left in this meal for: " + mealRows[i][0]);
-      continue;
-    }
-    mealPlanSheet2.getRange(targetRows[i], 2, 1, 6).setValues([mealRows[i]]);
-  }
+  writeRowsIntoMeal(ss.getSheetByName("Meal Plan"), editedRow, mealRows);
 
 }
 
@@ -557,7 +545,8 @@ function callClaudeForJson(body) {
 // Asks Claude which foods the entered text describes. A single entry can describe several foods (e.g. a
 // sandwich), so this returns a list of {row, text, amount}: row is the 0-indexed row in data (-1 if the food
 // isn't in Foods), text describes that one food for an online lookup, and amount is its quantity in the unit
-// of that row's Amount (null to use the Foods amount). Returns [] if the text names no food, or null if the call failed.
+// of that row's Amount (null to use the Foods amount). Returns {fillRemaining, items}: items is [] if the text names no
+// food, and fillRemaining is true if the text asks to fill the day's remaining calories. Returns null if the call failed.
 function chooseFoodsWithLlm(enteredText, data) {
   let foodList = "";
   for (let i = 1; i < data.length; i++) { // Row 0 is the header
@@ -569,7 +558,7 @@ function chooseFoodsWithLlm(enteredText, data) {
     max_tokens: 8000,
     fallbacks: "default",
     output_config: {
-      effort: "low",
+      effort: "medium",
       format: {
         type: "json_schema",
         schema: {
@@ -587,9 +576,10 @@ function chooseFoodsWithLlm(enteredText, data) {
                 required: ["row", "text", "amount"],
                 additionalProperties: false
               }
-            }
+            },
+            fill_remaining: { type: "boolean" }
           },
-          required: ["items"],
+          required: ["items", "fill_remaining"],
           additionalProperties: false
         }
       }
@@ -610,7 +600,9 @@ function chooseFoodsWithLlm(enteredText, data) {
       "in a sandwich), always set amount: use the quantity typed for that part, or estimate a typical one (the bread in half a sandwich is one slice). " +
       "Amount must always be in the unit of the row's serving amount, so if the serving is \"1g\" or \"100g\", amount is a number of grams " +
       "(one slice of whole wheat bread is about 40, not 1); only count-based servings like \"1 slice\" take a count. When row is -1, set amount to null. " +
-      "If the typed text is gibberish or names no food, return an empty items list.",
+      "If the typed text is gibberish or names no food, return an empty items list. " +
+      "If instead the typed text asks you to fill the rest of the day's calories (e.g. \"fill my remaining cals with some foods i like\"), " +
+      "set fill_remaining to true and return an empty items list; otherwise set fill_remaining to false.",
     messages: [{ role: "user", content: "Food list:\n" + foodList + "\nTyped text: " + enteredText }]
   });
   if (result === null || !Array.isArray(result.items)) return null;
@@ -624,7 +616,7 @@ function chooseFoodsWithLlm(enteredText, data) {
       items.push({ row: item.row, text: String(item.text), amount: amount });
     }
   }
-  return items;
+  return { fillRemaining: result.fill_remaining === true, items: items };
 }
 
 const CONSERVATIVE_MACRO_FACTOR = 0.7; // Asking for a conservative estimate cuts the looked-up macros by 30%
@@ -711,10 +703,221 @@ function scaleFoodRow(foodRow, newNum) {
   return row;
 }
 
-// Run once from the editor to replace the simple onEdit trigger with an installable one.
+// Run once from the editor to replace the simple onEdit trigger with an installable one, and to schedule
+// the nightly snapshot.
 function installEditTrigger() {
   for (const t of ScriptApp.getProjectTriggers()) {
-    if (t.getHandlerFunction() === "onEditInstalled") ScriptApp.deleteTrigger(t);
+    if (["onEditInstalled", "saveDailySnapshot"].includes(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
   }
   ScriptApp.newTrigger("onEditInstalled").forSpreadsheet(SpreadsheetApp.getActive()).onEdit().create();
+  ScriptApp.newTrigger("saveDailySnapshot").timeBased().everyDays(1).atHour(23).nearMinute(55).create();
+}
+
+// The first row goes in startRow and the rest in the blank rows below it in the same meal.
+function writeRowsIntoMeal(mealPlanSheet, startRow, mealRows) {
+  const targetRows = [startRow];
+  const lastRow = mealPlanSheet.getLastRow();
+  if (mealRows.length > 1 && lastRow > startRow) {
+    const below = mealPlanSheet.getRange(startRow + 1, 1, lastRow - startRow, 7).getValues();
+    for (let i = 0; i < below.length && targetRows.length < mealRows.length; i++) {
+      if (String(below[i][0]).trim() !== "") break; // Column A marks the Meal Total row or the next meal
+      if (below[i].slice(1, 7).every(x => String(x).trim() === "")) targetRows.push(startRow + 1 + i);
+    }
+  }
+  for (let i = 0; i < mealRows.length; i++) {
+    if (i >= targetRows.length) {
+      Logger.log("No blank row left in this meal for: " + mealRows[i][0]);
+      continue;
+    }
+    mealPlanSheet.getRange(targetRows[i], 2, 1, 6).setValues([mealRows[i]]);
+  }
+}
+
+const HISTORY_SPREADSHEET_PROPERTY = "HISTORY_SPREADSHEET_ID";
+
+// Returns the first sheet of the "Meal Plan History" spreadsheet (its ID is kept in script properties),
+// creating the spreadsheet in My Drive if createIfMissing is true. Returns null if there isn't one.
+function getHistorySheet(createIfMissing) {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(HISTORY_SPREADSHEET_PROPERTY);
+  if (id) {
+    try {
+      return SpreadsheetApp.openById(id).getSheets()[0];
+    } catch (err) {
+      Logger.log("Couldn't open the history spreadsheet: " + err);
+    }
+  }
+  if (!createIfMissing) return null;
+  const file = SpreadsheetApp.create("Meal Plan History");
+  const sheet = file.getSheets()[0];
+  sheet.getRange(1, 1, 1, 9).setValues([["Date", "Meal", "Food", "Brand", "Amount", "Protein", "Carbs", "Fat", "Calories"]]);
+  sheet.setFrozenRows(1);
+  props.setProperty(HISTORY_SPREADSHEET_PROPERTY, file.getId());
+  Logger.log("Created Meal Plan History: " + file.getUrl());
+  return sheet;
+}
+
+// Returns the Meal Plan rows inside a numbered meal section ("1 - Breakfast" through its Meal Total), each as
+// {meal, values}. Rows in other sections, like the Remainder list below the meals, are left out.
+function mealSectionRows(plan) {
+  const rows = [];
+  let meal = null;
+  for (let i = 1; i < plan.length; i++) {
+    const label = String(plan[i][0]).trim();
+    if (label === "Meal Total") continue;
+    if (/^\d+\s*-/.test(label)) meal = label;
+    else if (label !== "") meal = null;
+    if (meal !== null) rows.push({ meal: meal, values: plan[i] });
+  }
+  return rows;
+}
+
+function formatHistoryDate(value, timeZone) {
+  return value instanceof Date ? Utilities.formatDate(value, timeZone, "yyyy-MM-dd") : String(value);
+}
+
+// Runs nightly from a time-based trigger (see installEditTrigger). Appends the day's filled-in Meal Plan rows to the
+// Meal Plan History spreadsheet, replacing any rows already saved for the same date.
+function saveDailySnapshot() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const timeZone = ss.getSpreadsheetTimeZone();
+  const date = Utilities.formatDate(new Date(), timeZone, "yyyy-MM-dd");
+  const plan = ss.getSheetByName("Meal Plan").getDataRange().getValues();
+  const rows = [];
+  for (const { meal, values: r } of mealSectionRows(plan)) {
+    if (String(r[1]).trim() === "" || String(r[3]).trim() === "") continue; // Only rows with a food and an amount
+    rows.push([date, meal, r[1], r[2], String(r[3]), r[4], r[5], r[6], r[7]]);
+  }
+  const sheet = getHistorySheet(true);
+  const existing = sheet.getDataRange().getValues();
+  for (let i = existing.length - 1; i >= 1; i--) {
+    if (formatHistoryDate(existing[i][0], timeZone) === date) sheet.deleteRow(i + 1);
+  }
+  if (rows.length === 0) return;
+  const firstRow = sheet.getLastRow() + 1;
+  sheet.getRange(firstRow, 1, rows.length, 1).setNumberFormat("@"); // Keep the date and amount as plain text
+  sheet.getRange(firstRow, 5, rows.length, 1).setNumberFormat("@");
+  sheet.getRange(firstRow, 1, rows.length, 9).setValues(rows);
+  Logger.log("Saved " + rows.length + " rows for " + date);
+}
+
+// Fills what's left of the day (the Remainder row under the Target row: protein, carbs, fat and calories) with foods
+// eaten most often in the Meal Plan History and today's plan, plus foods on the "I like" lists below the Remainder row.
+// Starts at startRow and continues into the blank rows below it in the same meal.
+function fillRemainingCalories(ss, startRow, data) {
+  const mealPlanSheet = ss.getSheetByName("Meal Plan");
+  const plan = mealPlanSheet.getDataRange().getValues();
+  const remainderIndex = plan.findIndex(r => String(r[0]).trim() === "Remainder");
+  if (remainderIndex < 0) {
+    Logger.log("No Remainder row found on the Meal Plan");
+    return;
+  }
+  const remaining = plan[remainderIndex].slice(4, 8).map(x => parseFloat(x)); // Protein, carbs, fat, calories
+  if (isNaN(remaining[3]) || remaining[3] <= 0) {
+    Logger.log("No remaining calories to fill: " + remaining[3]);
+    return;
+  }
+  const foodIndex = {};
+  function foodKey(food, brand) {
+    return String(food).trim().toLowerCase() + "|" + String(brand).trim().toLowerCase();
+  }
+  for (let i = 1; i < data.length; i++) {
+    const key = foodKey(data[i][0], data[i][1]);
+    if (!(key in foodIndex)) foodIndex[key] = i;
+  }
+  // For each Foods row: the days it was eaten, the amounts, and whether it's on an "I like" list
+  const stats = {};
+  function statsFor(row) {
+    if (!stats[row]) stats[row] = { days: {}, amounts: [], liked: false };
+    return stats[row];
+  }
+  function countFood(day, food, brand, amount) {
+    const row = foodIndex[foodKey(food, brand)];
+    if (row === undefined) return;
+    const s = statsFor(row);
+    s.days[day] = true;
+    if (String(amount).trim() !== "") s.amounts.push(String(amount));
+  }
+  const timeZone = ss.getSpreadsheetTimeZone();
+  const historySheet = getHistorySheet(false);
+  if (historySheet !== null) {
+    const history = historySheet.getDataRange().getValues();
+    for (let i = 1; i < history.length; i++) countFood(formatHistoryDate(history[i][0], timeZone), history[i][2], history[i][3], history[i][4]);
+  }
+  for (const { values: r } of mealSectionRows(plan)) countFood("today", r[1], r[2], r[3]);
+  for (let i = remainderIndex + 1; i < plan.length; i++) {
+    const row = foodIndex[foodKey(plan[i][1], plan[i][2])];
+    if (row === undefined) continue;
+    const s = statsFor(row);
+    s.liked = true;
+    if (String(plan[i][3]).trim() !== "") s.amounts.push(String(plan[i][3]));
+  }
+  const score = row => Object.keys(stats[row].days).length + (stats[row].liked ? 1 : 0);
+  const candidates = Object.keys(stats).map(Number).sort((a, b) => score(b) - score(a)).slice(0, 40);
+  if (candidates.length === 0) {
+    Logger.log("No frequently eaten or liked foods found to fill with");
+    return;
+  }
+  let candidateList = "";
+  for (const i of candidates) {
+    const d = data[i];
+    candidateList += i + ": " + d[0] + (d[1] ? " (" + d[1] + ")" : "") + " | serving " + d[2] + " | P/C/F " + d[3] + "/" + d[4] + "/" + d[5] +
+      " | " + d[6] + " kcal per serving | eaten on " + Object.keys(stats[i].days).length + " days" +
+      (stats[i].liked ? " | on their 'I like' lists" : "") + " | usual amounts: " + stats[i].amounts.slice(-3).join(", ") + "\n";
+  }
+  const result = callClaudeForJson({
+    model: LLM_MODEL,
+    max_tokens: 16000,
+    fallbacks: "default",
+    output_config: {
+      effort: "high",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { row: { type: "integer" }, amount: { type: "number" } },
+                required: ["row", "amount"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["items"],
+          additionalProperties: false
+        }
+      }
+    },
+    system: "You plan the rest of someone's day of eating while they are on a calorie-controlled cut. Choose 2 to 5 foods from the candidates, " +
+      "with amounts, so that what you add fits what they have left for the day: land as close as possible to the remaining calories (aim for " +
+      "within 25 kcal and never more than 50 over), then get as close as you can to the remaining protein, carbs and fat (a negative number means " +
+      "they're already over, so keep that macro low). Prefer foods they eat often or have on their 'I like' lists, combinations they'd plausibly eat " +
+      "together at this point in the day, and realistic portions close to their usual amounts. Each candidate line is " +
+      "\"row: food (brand) | serving | P/C/F per serving | kcal per serving | days eaten | (on their 'I like' lists) | usual amounts\". " +
+      "Give amount in the unit of the serving: grams if the serving is in grams, or a count of units for servings like \"1 Scoop\" or " +
+      "\"7 Almonds\". A food's calories and macros are amount / (the serving's number) × the per-serving values. Add up your totals before " +
+      "answering and adjust the amounts until they fit.",
+    messages: [{
+      role: "user",
+      content: "Remaining for today: " + remaining[3] + " kcal, protein " + remaining[0] + " g, carbs " + remaining[1] + " g, fat " + remaining[2] + " g" +
+        "\nCandidate foods:\n" + candidateList
+    }]
+  });
+  if (result === null || !Array.isArray(result.items)) return;
+  const mealRows = [];
+  const added = [0, 0, 0];
+  for (const item of result.items) {
+    if (!candidates.includes(item.row) || !(item.amount > 0)) continue;
+    const foodRow = data[item.row].slice(0, 6);
+    const scaledRow = scaleFoodRow(foodRow, item.amount);
+    const row = scaledRow !== null ? scaledRow : foodRow;
+    for (let m = 0; m < 3; m++) added[m] += parseFloat(row[3 + m]) || 0;
+    mealRows.push(row);
+  }
+  Logger.log("Filling " + remaining.join("/") + " (P/C/F/kcal) with " + added.map(x => x.toFixed(1)).join("/") + "/" +
+    Math.round(added[0] * 4 + added[1] * 4 + added[2] * 9) + ": " + JSON.stringify(mealRows));
+  writeRowsIntoMeal(mealPlanSheet, startRow, mealRows);
 }
