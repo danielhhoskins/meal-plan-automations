@@ -7,12 +7,40 @@
 // Runs from an installable trigger (see installEditTrigger) because simple onEdit
 // triggers aren't allowed to call UrlFetchApp, which the LLM food lookup needs.
 function onEditInstalled(e) {
-  changeMacrosBasedOnChangeToAmount(e);
-  newValueOfIndividualMacro(e);
-  addAmountToIndividualMacro(e);
-  searchForFoodAndFillRow(e);
-  clearRowIfFoodCellIsDeleted(e);
-  removeBlankRows(e);
+  const handlers = [changeMacrosBasedOnChangeToAmount, newValueOfIndividualMacro, addAmountToIndividualMacro,
+    searchForFoodAndFillRow, clearRowIfFoodCellIsDeleted, removeBlankRows];
+  for (const handler of handlers) {
+    try {
+      handler(e);
+    } catch (err) { // Show the error in the sheet instead of failing silently
+      let foodCell = null;
+      if (handler === searchForFoodAndFillRow && e.range.getNumRows() === 1 && e.range.getNumColumns() === 1 &&
+          String(e.range.getValue()).trim() !== "" &&
+          e.range.getSheet().getRange(e.range.getRow(), 3, 1, 5).isBlank()) foodCell = e.range; // The entry wasn't filled
+      showError(handler.name + " failed: " + err, foodCell);
+    }
+  }
+}
+
+const ERROR_MARK = "\u26A0 ";
+const ERROR_SEPARATOR = " \u26A0 ";
+
+// Shows an error in the sheet: a toast, and if foodCell is given, the reason in that Food cell's text as
+// "⚠ <entry> ⚠ <reason>" (in the text because notes and colors stay behind when removeBlankRows moves rows,
+// and toasts don't show in the phone app). Editing the cell retries the entry.
+function showError(message, foodCell) {
+  Logger.log("Error: " + message);
+  SpreadsheetApp.getActiveSpreadsheet().toast(message, "Meal plan script error", 30);
+  if (foodCell) foodCell.setValue(ERROR_MARK + stripErrorMark(foodCell.getValue()) + ERROR_SEPARATOR + message);
+}
+
+// Returns the entry without the error showError added, so an edited error cell is looked up again.
+function stripErrorMark(text) {
+  text = String(text);
+  if (!text.startsWith(ERROR_MARK.trim())) return text;
+  text = text.slice(ERROR_MARK.trim().length);
+  const end = text.indexOf(ERROR_SEPARATOR);
+  return (end === -1 ? text : text.slice(0, end)).trim();
 }
 
 function indexOfMax(arr) {
@@ -294,8 +322,10 @@ function searchForFoodAndFillRow(e) {
   }
   if (e.range.getColumn() != 2) return;
   let ss = SpreadsheetApp.getActiveSpreadsheet();
-  let enteredStr = e.range.getValue().toLowerCase();
-  if (enteredStr === "") return;
+  if (e.range.getNumRows() !== 1 || e.range.getNumColumns() !== 1) return;
+  const enteredText = stripErrorMark(e.range.getValue());
+  let enteredStr = enteredText.toLowerCase();
+  if (enteredStr.trim() === "") return;
   enteredStr = replacePunctuationWithWhiteSpace(enteredStr).trim();
   let mealPlanSheet = ss.getSheets()[0];
   // let foodsSheet = ss.getSheets()[1];
@@ -307,11 +337,17 @@ function searchForFoodAndFillRow(e) {
     return;
   }
   let data = ss.getSheetByName("Foods").getDataRange().getValues();
-  const choice = chooseFoodsWithLlm(String(e.range.getValue()), data);
+  const choice = chooseFoodsWithLlm(enteredText, data);
   if (choice === null) { // LLM call failed: use the old algorithm
+    const reason = lastLlmError || "the Claude call failed";
     let matchedRowIndex = getBestMatch(enteredStr, e);
+    if (matchedRowIndex === undefined) {
+      showError("Couldn't look this up: " + reason, e.range);
+      return;
+    }
     copyData(e.source, `Foods!A${matchedRowIndex+1}:F${matchedRowIndex+1}`, `Meal Plan!B${editedRow}:G${editedRow}`);
     Logger.log("Done moving macros")
+    showError("Filled \"" + enteredText + "\" with the old name search, so check it's the right food and amount: " + reason);
     return;
   }
   if (choice.fillRemaining) {
@@ -320,7 +356,7 @@ function searchForFoodAndFillRow(e) {
   }
   const items = choice.items;
   if (items.length === 0) {
-    Logger.log("LLM found no food in: " + enteredStr);
+    showError("Didn't recognize a food in this", e.range);
     return;
   }
   const foodsSheet = ss.getSheetByName("Foods");
@@ -329,6 +365,7 @@ function searchForFoodAndFillRow(e) {
   nextFoodsRow++;
   const mealRows = [];
   const restIndexes = []; // Foods to size so this entry uses up the rest of the day's calories
+  const failures = []; // Foods that couldn't be looked up
   for (const item of items) {
     let foodRow, amount;
     if (item.row !== -1) {
@@ -337,7 +374,7 @@ function searchForFoodAndFillRow(e) {
     } else { // Not in Foods: look it up online and add it
       const newFood = lookUpNewFoodWithLlm(item.text);
       if (newFood === null) {
-        Logger.log("No food added for: " + item.text);
+        failures.push(item.text + ": " + (lastLlmError || "couldn't find its nutrition facts"));
         continue;
       }
       foodRow = [newFood.food, newFood.brand, newFood.serving, newFood.protein, newFood.carbs, newFood.fat];
@@ -351,8 +388,13 @@ function searchForFoodAndFillRow(e) {
     mealRows.push(scaledRow !== null ? scaledRow : foodRow);
     if (item.restOfCalories) restIndexes.push(mealRows.length - 1);
   }
+  if (mealRows.length === 0) {
+    showError("Couldn't look this up: " + failures.join("; "), e.range);
+    return;
+  }
   if (restIndexes.length > 0) sizeToRestOfCalories(ss, mealRows, restIndexes);
   writeRowsIntoMeal(ss.getSheetByName("Meal Plan"), editedRow, mealRows);
+  if (failures.length > 0) showError("Left out of \"" + enteredText + "\": " + failures.join("; "));
 
 }
 
@@ -498,31 +540,41 @@ function removeBlankRows(e) {
 }
 
 const LLM_MODEL = "claude-opus-5-5";
+let lastLlmError = ""; // Why the last LLM call failed, shown in the sheet by showError
 
 // Sends a Messages API request and returns the JSON object in Claude's final text block, or null if the
 // call failed. Continues the request if a web search pauses the turn (stop_reason "pause_turn").
 function callClaudeForJson(body) {
+  lastLlmError = "";
   const apiKey = PropertiesService.getScriptProperties().getProperty("ANTHROPIC_API_KEY");
   if (!apiKey) {
     Logger.log("No ANTHROPIC_API_KEY script property set");
+    lastLlmError = "No ANTHROPIC_API_KEY script property set";
     return null;
   }
+  const headers = {
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "server-side-fallback-2026-07-01"
+  };
+  // Keys that aren't scoped to a workspace must name one in this header
+  const workspaceId = PropertiesService.getScriptProperties().getProperty("ANTHROPIC_WORKSPACE_ID");
+  if (workspaceId) headers["anthropic-workspace-id"] = workspaceId;
   const messages = body.messages.slice();
   try {
     for (let attempt = 0; attempt < 5; attempt++) {
       const response = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
         method: "post",
         contentType: "application/json",
-        headers: {
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "server-side-fallback-2026-07-01"
-        },
+        headers: headers,
         payload: JSON.stringify(Object.assign({}, body, { messages: messages })),
         muteHttpExceptions: true
       });
       if (response.getResponseCode() !== 200) {
         Logger.log("LLM call failed: " + response.getResponseCode() + " " + response.getContentText());
+        let apiMessage = response.getContentText();
+        try { apiMessage = JSON.parse(apiMessage).error.message; } catch (parseErr) {}
+        lastLlmError = "Claude API error " + response.getResponseCode() + ": " + String(apiMessage).slice(0, 300);
         return null;
       }
       const message = JSON.parse(response.getContentText());
@@ -532,15 +584,18 @@ function callClaudeForJson(body) {
       }
       if (message.stop_reason === "refusal") {
         Logger.log("LLM refused: " + JSON.stringify(message.stop_details));
+        lastLlmError = "Claude refused the request";
         return null;
       }
       const textBlocks = message.content.filter(b => b.type === "text");
       return JSON.parse(textBlocks[textBlocks.length - 1].text);
     }
     Logger.log("LLM call kept pausing; giving up");
+    lastLlmError = "the Claude call kept pausing, so it gave up";
     return null;
   } catch (err) {
     Logger.log("LLM call error: " + err);
+    lastLlmError = "Claude API call error: " + err;
     return null;
   }
 }
@@ -658,12 +713,19 @@ function lookUpNewFoodWithLlm(enteredText) {
         }
       }
     },
-    tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }],
+    // The basic search and fetch tools, not the _20260209 ones: those make Claude filter the results with code that
+    // kept crashing, so it answered from the first result only (often a wrong user-entered aggregator entry).
+    tools: [
+      { type: "web_search_20250305", name: "web_search", max_uses: 5 },
+      { type: "web_fetch_20250910", name: "web_fetch", max_uses: 5 }
+    ],
     system: "You estimate nutrition facts for a food someone typed into their meal plan, so it can be added to their food list. " +
       "First decide whether the typed text names a recognizable food or drink (a generic food, a dish, or a branded or restaurant product). " +
       "If it is gibberish or not a food, set is_food to false and leave the other fields empty or zero. " +
-      "Otherwise you must use web search before answering, even if you think you know the numbers. Look up reliable nutrition facts " +
-      "(the brand's or restaurant's own nutrition info first, then USDA or another reputable database) and give your best estimate. " +
+      "Otherwise you must use web search before answering, even if you think you know the numbers. Take the numbers from the brand's or " +
+      "restaurant's own nutrition info (their website or nutrition calculator, or the product's label on a retailer page), opening the page " +
+      "with web fetch to read it; for generic foods, use USDA. Sites with user-entered or estimated entries (e.g. MyFitnessPal, FatSecret, " +
+      "Carb Manager, Nutritionix, Eat This Much) are often wrong, so use them only if no official source can be found, and then check they agree. " +
       "Use a clear, specific food name (title case, without the brand) and the brand if there is one, or an empty string. " +
       "Choose a sensible serving: the package or menu serving for branded and restaurant items, or a gram weight such as 100g for generic foods. " +
       "Write serving like the existing list does, e.g. \"28g\", \"1 Bowl\", \"150 mL\", \"7 Almonds\". Give protein, carbs and fat in grams for that serving. " +
