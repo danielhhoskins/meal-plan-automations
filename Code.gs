@@ -7,6 +7,9 @@
 // Runs from an installable trigger (see installEditTrigger) because simple onEdit
 // triggers aren't allowed to call UrlFetchApp, which the LLM food lookup needs.
 function onEditInstalled(e) {
+  // Every handler acts on the Meal Plan, so edits in other tabs (e.g. Foods) must not run them: they would
+  // change or clear the Meal Plan row with the same number.
+  if (e.range.getSheet().getName() !== "Meal Plan") return;
   const handlers = [changeMacrosBasedOnChangeToAmount, newValueOfIndividualMacro, addAmountToIndividualMacro,
     searchForFoodAndFillRow, clearRowIfFoodCellIsDeleted, removeBlankRows];
   for (const handler of handlers) {
@@ -792,11 +795,19 @@ function writeRowsIntoMeal(mealPlanSheet, startRow, mealRows) {
       if (below[i].slice(1, 7).every(x => String(x).trim() === "")) targetRows.push(startRow + 1 + i);
     }
   }
-  for (let i = 0; i < mealRows.length; i++) {
-    if (i >= targetRows.length) {
-      Logger.log("No blank row left in this meal for: " + mealRows[i][0]);
-      continue;
+  if (targetRows.length < mealRows.length) { // Meal is full: add rows above its Meal Total row so no food is dropped
+    const labels = mealPlanSheet.getRange(1, 1, Math.max(lastRow, startRow), 1).getValues();
+    let totalRow = startRow + 1;
+    while (totalRow <= labels.length && String(labels[totalRow - 1][0]).trim() === "") totalRow++;
+    const needed = mealRows.length - targetRows.length;
+    mealPlanSheet.insertRowsAfter(totalRow - 1, needed); // After, so the new rows get a food row's formatting
+    for (let r = totalRow; r < totalRow + needed; r++) {
+      mealPlanSheet.getRange(r, 8).setFormula(`=E${r}*4+F${r}*4+G${r}*9`);
+      targetRows.push(r);
     }
+    Logger.log("Added " + needed + " rows to the meal at row " + totalRow);
+  }
+  for (let i = 0; i < mealRows.length; i++) {
     mealPlanSheet.getRange(targetRows[i], 2, 1, 6).setValues([mealRows[i]]);
   }
 }
